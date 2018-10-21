@@ -1,137 +1,170 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
-	"net/http"
+	"net"
 	"os"
+	"strconv"
+	"sync"
 	"time"
-    "fmt"
+
 	"github.com/davecgh/go-spew/spew"
-	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 )
+
+// Block represents each 'item' in the blockchain
 type Block struct {
-	Index int
-	timestamp string
-	BPM int
-	hash string
-	prevHash string
+	Index     int
+	Timestamp string
+	BPM       int
+	Hash      string
+	PrevHash  string
 }
+
+// Blockchain is a series of validated Blocks
 var Blockchain []Block
 
-type Message struct {
-	BPM int
+// bcServer handles incoming concurrent Blocks
+var bcServer chan []Block
+var mutex = &sync.Mutex{}
+
+func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	bcServer = make(chan []Block)
+
+	// create genesis block
+	t := time.Now()
+	genesisBlock := Block{0, t.String(), 0, "", ""}
+	spew.Dump(genesisBlock)
+	Blockchain = append(Blockchain, genesisBlock)
+
+	httpPort := os.Getenv("PORT")
+
+	// start TCP and serve TCP server
+	server, err := net.Listen("tcp", ":"+httpPort)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("HTTP Server Listening on port :", httpPort)
+	defer server.Close()
+
+	for {
+		conn, err := server.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go handleConn(conn)
+	}
+
 }
-//to calculate hash of new block
-func calcHash(block Block) string {
-	record:=string(block.Index)+block.timestamp + string(block.BPM) + block.prevHash
-	h:=sha256.New()
+
+func handleConn(conn net.Conn) {
+
+	defer conn.Close()
+
+	io.WriteString(conn, "Enter a new BPM:")
+
+	scanner := bufio.NewScanner(conn)
+
+	// take in BPM from stdin and add it to blockchain after conducting necessary validation
+	go func() {
+		for scanner.Scan() {
+			bpm, err := strconv.Atoi(scanner.Text())
+			if err != nil {
+				log.Printf("%v not a number: %v", scanner.Text(), err)
+				continue
+			}
+			newBlock, err := generateBlock(Blockchain[len(Blockchain)-1], bpm)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			if isBlockValid(newBlock, Blockchain[len(Blockchain)-1]) {
+				newBlockchain := append(Blockchain, newBlock)
+				replaceChain(newBlockchain)
+			}
+
+			bcServer <- Blockchain
+			io.WriteString(conn, "\nEnter a new BPM:")
+		}
+	}()
+
+	// simulate receiving broadcast
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			mutex.Lock()
+			output, err := json.Marshal(Blockchain)
+			if err != nil {
+				log.Fatal(err)
+			}
+			mutex.Unlock()
+			io.WriteString(conn, string(output))
+		}
+	}()
+
+	for _ = range bcServer {
+		spew.Dump(Blockchain)
+	}
+
+}
+
+// make sure block is valid by checking index, and comparing the hash of the previous block
+func isBlockValid(newBlock, oldBlock Block) bool {
+	if oldBlock.Index+1 != newBlock.Index {
+		return false
+	}
+
+	if oldBlock.Hash != newBlock.PrevHash {
+		return false
+	}
+
+	if calculateHash(newBlock) != newBlock.Hash {
+		return false
+	}
+
+	return true
+}
+
+// make sure the chain we're checking is longer than the current blockchain
+func replaceChain(newBlocks []Block) {
+	mutex.Lock()
+	if len(newBlocks) > len(Blockchain) {
+		Blockchain = newBlocks
+	}
+	mutex.Unlock()
+}
+
+// SHA256 hasing
+func calculateHash(block Block) string {
+	record := string(block.Index) + block.Timestamp + string(block.BPM) + block.PrevHash
+	h := sha256.New()
 	h.Write([]byte(record))
 	hashed := h.Sum(nil)
 	return hex.EncodeToString(hashed)
 }
 
-//to generate new Block
+// create a new block using previous block's hash
 func generateBlock(oldBlock Block, BPM int) (Block, error) {
-	
-		var newBlock Block
-	
-		t := time.Now()
-	
-		newBlock.Index = oldBlock.Index + 1
-		newBlock.timestamp = t.String()
-		newBlock.BPM = BPM
-		newBlock.prevHash = oldBlock.hash
-		newBlock.hash = calcHash(newBlock)
-	
-		return newBlock, nil
-}
-//to check that new block added  is valid
-func validate(old,current Block) bool {
 
-	if old.Index+1!=current.Index {
-		return false
-	} else if old.hash!=current.prevHash  {
-		return false
-	} else if calcHash(current)!=current.hash {
-		return false
-	} else {
-		return true
-	}
-}
+	var newBlock Block
 
-//PoL proof of length .Miner who is succesful in generating the maximum chain length gets to add the block
-func replaceChain(newBlocks []Block) {
-	if len(newBlocks) > len(Blockchain) {
-		Blockchain = newBlocks
-	}
-}
+	t := time.Now()
 
-func runServer() error {
-	mux := makeMuxRouter()
-	httpAddr := os.Getenv("ADDR")
-	log.Println("Listening on ", os.Getenv("ADDR"))
-	s := &http.Server{
-		Addr:           ":" + httpAddr,
-		Handler:        mux,
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   10 * time.Second,
-		MaxHeaderBytes: 1 << 20,
-	}
+	newBlock.Index = oldBlock.Index + 1
+	newBlock.Timestamp = t.String()
+	newBlock.BPM = BPM
+	newBlock.PrevHash = oldBlock.Hash
+	newBlock.Hash = calculateHash(newBlock)
 
-	if err := s.ListenAndServe(); err != nil {
-		return err
-	}
-
-	return nil
-
-}
-//routeHandlers
-func getChain(w http.ResponseWriter,r* http.Request) {
-	fmt.Println(Blockchain);
-	bytes, err := json.MarshalIndent(Blockchain,"", "    ")
-	if err!=nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	io.WriteString(w,string(bytes))
-}
-func writeBlock(w http.ResponseWriter,r* http.Request) {
-  
-	newBlock,err:=generateBlock(Blockchain[len(Blockchain)-1],50)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if validate(Blockchain[len(Blockchain)-1],newBlock) {
-		newBlockchain:=append(Blockchain,newBlock)
-		replaceChain(newBlockchain)
-		spew.Dump(Blockchain)
-	}
-}
-/////////
-//route handler
-func makeMuxRouter() http.Handler {
-	muxRouter := mux.NewRouter()
-	muxRouter.HandleFunc("/", getChain).Methods("GET")
-	muxRouter.HandleFunc("/write", writeBlock).Methods("POST")
-	return muxRouter
-}
-func main() {
-	err := godotenv.Load()
-    if err!=nil {
-		log.Fatal(err)
-	}	
-	go func() {
-		t := time.Now()
-		genesisBlock := Block{0, t.String(), 0, "", ""}
-		spew.Dump(genesisBlock)
-		Blockchain = append(Blockchain, genesisBlock)
-	}()
-	log.Fatal(runServer())
+	return newBlock, nil
 }
